@@ -1,0 +1,102 @@
+rules_version = '2';
+
+// Firestore Security Rules for Quantica Digital (Study Bison)
+// Collections:
+//   users/{uid}/enrollments/{batchId}  -> per-user batch enrollments
+//   leaderboard/{uid}                  -> global learner leaderboard
+//   leaderboardUsers/{uid}             -> public profiles of signed-in learners
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
+
+    // True when the request comes from a signed-in user and the doc is theirs.
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    // ---------------------------------------------------------------------
+    // Per-user enrollments
+    //   users/{uid}/enrollments/{batchId}
+    // Only the owner may read or write their own enrollments.
+    // ---------------------------------------------------------------------
+    match /users/{uid} {
+      // A profile doc is optional; if present, only the owner can read/write.
+      allow read: if isOwner(uid);
+      allow write: if isOwner(uid);
+
+      match /enrollments/{batchId} {
+        allow read: if isOwner(uid);
+        allow create: if isOwner(uid)
+          && request.resource.data.batchId is string
+          && request.resource.data.batchName is string;
+        allow update: if isOwner(uid);
+        allow delete: if isOwner(uid);
+      }
+    }
+
+    // Activity aggregates are public, so store only public profile/activity
+    // fields here. A trusted server (Admin SDK) maintains minute/PDF totals
+    // and studyDays; clients cannot create or change these ranking fields.
+    // Existing documents remain readable without a migration.
+    match /leaderboard/{uid} {
+      allow read: if true;
+
+      // Compatibility for the existing legacy point writer. These points
+      // are no longer used for ranking. Rules cannot verify actual playback.
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly([
+          'userId', 'displayName', 'photoURL', 'points',
+          'lastBatchId', 'lastContentId', 'updatedAt'
+        ])
+        && request.resource.data.userId == uid
+        && request.resource.data.displayName is string
+        && request.resource.data.photoURL is string
+        && request.resource.data.lastBatchId is string
+        && request.resource.data.lastContentId is string
+        && request.resource.data.points == 1
+        && request.resource.data.updatedAt == request.time;
+
+      allow update: if isOwner(uid)
+        && request.resource.data.userId == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'userId', 'displayName', 'photoURL', 'points',
+          'lastBatchId', 'lastContentId', 'updatedAt'
+        ])
+        && request.resource.data.displayName is string
+        && request.resource.data.photoURL is string
+        && request.resource.data.lastBatchId is string
+        && request.resource.data.lastContentId is string
+        && request.resource.data.points is int
+        && request.resource.data.points == resource.data.get('points', 0) + 1
+        && request.resource.data.updatedAt == request.time;
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Public leaderboard profiles
+    //   leaderboardUsers/{uid}
+    // Only public fields; never store email addresses or tokens here.
+    // ---------------------------------------------------------------------
+    match /leaderboardUsers/{uid} {
+      allow read: if true;
+      allow create, update: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['displayName', 'photoURL', 'updatedAt'])
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() <= 200
+        && request.resource.data.photoURL is string
+        && request.resource.data.photoURL.size() <= 2048
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    // Deny everything else by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
