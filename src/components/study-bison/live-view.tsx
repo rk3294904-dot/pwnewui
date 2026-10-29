@@ -3,25 +3,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useApp } from "@/lib/store";
 import { firebaseAuth, getEnrolledBatchIds } from "@/lib/firebase";
+import { GlassSkeleton, SafeImage, EmptyState } from "./glass";
 import {
-  GlassBadge,
-  GlassButton,
-  GlassCard,
-  GlassSkeleton,
-  SafeImage,
-  EmptyState,
-} from "./glass";
-import {
-  Radio,
-  Play,
+  CalendarDays,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Clock,
-  CalendarPlus,
-  Loader2,
-  BookOpen,
+  Radio,
   RefreshCw,
-  Search,
-  CheckCircle2,
-  X,
+  Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -30,17 +21,14 @@ import { cn } from "@/lib/utils";
 /* ------------------------------------------------------------------ */
 
 type Status = "live" | "upcoming" | "ended";
-type Filter = "all" | Status;
 
-interface RawLiveClass {
+interface RawClass {
   id: string;
   batchId: string;
   batchName: string;
   batchImage?: string;
   title: string;
   subject: string;
-  startTime: string;
-  endTime: string;
   startMs: number;
   endMs: number;
   thumbnail: string;
@@ -49,8 +37,14 @@ interface RawLiveClass {
   subjectSlug: string;
 }
 
-interface LiveClass extends RawLiveClass {
+interface ScheduleClass extends RawClass {
   status: Status;
+}
+
+interface BatchInfo {
+  id: string;
+  name: string;
+  image?: string;
 }
 
 interface CatalogBatch {
@@ -65,6 +59,16 @@ interface CatalogBatch {
 
 const toMs = (iso?: string) => (iso ? new Date(iso).getTime() : NaN);
 
+function localDateStr(d: Date): string {
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${m}-${day}`;
+}
+
+function onDate(ms: number, dateStr: string): boolean {
+  return !Number.isNaN(ms) && localDateStr(new Date(ms)) === dateStr;
+}
+
 function getStatus(startMs: number, endMs: number, now: number): Status {
   if (Number.isNaN(startMs)) return "upcoming";
   if (now < startMs) return "upcoming";
@@ -72,57 +76,29 @@ function getStatus(startMs: number, endMs: number, now: number): Status {
   return "ended";
 }
 
-function withinToday(startMs: number, endMs: number): boolean {
-  const d = new Date();
-  const start = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-  const end = start + 24 * 60 * 60 * 1000;
-  if (!Number.isNaN(startMs) && startMs >= start && startMs < end) return true;
-  if (!Number.isNaN(endMs) && endMs >= start && endMs < end) return true;
-  return false;
-}
-
 function fmtClock(ms: number): string {
   if (Number.isNaN(ms)) return "--:--";
-  return new Date(ms).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  return new Date(ms).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
 }
 
-function fmtSpan(ms: number): string {
-  const mins = Math.max(0, Math.round(ms / 60000));
-  const h = Math.floor(mins / 60);
-  const m = mins % 60;
-  if (h === 0) return `${m}m`;
-  return m === 0 ? `${h}h` : `${h}h ${m}m`;
+function fmtDateLabel(dateStr: string): string {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString("en-GB", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
 }
 
-function countdownLabel(startMs: number, now: number): string {
-  const diff = startMs - now;
-  if (Number.isNaN(diff)) return "Scheduled today";
-  if (diff < 60_000) return "Starting now";
-  return `Starts in ${fmtSpan(diff)}`;
-}
-
-function progressOf(c: LiveClass, now: number): number | null {
+function progressOf(c: ScheduleClass, now: number): number | null {
   if (c.status !== "live" || Number.isNaN(c.startMs) || Number.isNaN(c.endMs) || c.endMs <= c.startMs) return null;
   return Math.min(100, Math.max(0, ((now - c.startMs) / (c.endMs - c.startMs)) * 100));
 }
 
-function calendarUrl(c: LiveClass): string {
-  const fmt = (ms: number) => new Date(ms).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
-  const start = Number.isNaN(c.startMs) ? Date.now() : c.startMs;
-  const end = Number.isNaN(c.endMs) ? start + 60 * 60 * 1000 : c.endMs;
-  const params = new URLSearchParams({
-    action: "TEMPLATE",
-    text: c.title,
-    details: `${c.subject ? c.subject + " · " : ""}${c.batchName}`,
-    dates: `${fmt(start)}/${fmt(end)}`,
-  });
-  return `https://calendar.google.com/calendar/render?${params.toString()}`;
-}
-
-const STATUS_STYLE: Record<Status, { stripe: string; label: string }> = {
-  live: { stripe: "bg-red-500", label: "Live now" },
-  upcoming: { stripe: "bg-[#4a9eff]", label: "Upcoming" },
-  ended: { stripe: "bg-white/15", label: "Ended" },
+const PILL: Record<Status, { label: string; cls: string }> = {
+  ended: { label: "ENDED", cls: "bg-emerald-500" },
+  live: { label: "LIVE", cls: "bg-red-600" },
+  upcoming: { label: "UPCOMING", cls: "bg-purple-600" },
 };
 
 /* ------------------------------------------------------------------ */
@@ -131,26 +107,28 @@ const STATUS_STYLE: Record<Status, { stripe: string; label: string }> = {
 
 export function LiveView() {
   const { navigate } = useApp();
-  const [raw, setRaw] = useState<RawLiveClass[] | null>(null);
+
+  const [batches, setBatches] = useState<BatchInfo[]>([]);
+  const [raw, setRaw] = useState<RawClass[]>([]);
+  const [batchId, setBatchId] = useState("");
+  const [dateStr, setDateStr] = useState(() => localDateStr(new Date()));
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [failed, setFailed] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [now, setNow] = useState(() => Date.now());
-
-  const [filter, setFilter] = useState<Filter>("all");
-  const [subject, setSubject] = useState<string>("all");
-  const [query, setQuery] = useState("");
+  const [showAll, setShowAll] = useState(false);
 
   const hasLoaded = useRef(false);
+  const rowRef = useRef<HTMLDivElement>(null);
 
-  /* keep statuses and countdowns fresh without refetching */
+  /* statuses tick without refetching */
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 30_000);
     return () => clearInterval(t);
   }, []);
 
-  /* quiet background refetch every two minutes */
+  /* quiet background refetch */
   useEffect(() => {
     const t = setInterval(() => setAttempt((v) => v + 1), 120_000);
     return () => clearInterval(t);
@@ -183,25 +161,28 @@ export function LiveView() {
         catalog = [];
       }
 
-      // Enrolled batches first; new users see the first few catalog batches.
       const targetIds = enrolledIds.length > 0 ? enrolledIds : catalog.slice(0, 6).map((b) => b._id);
+      const infos: BatchInfo[] = targetIds.map((id) => {
+        const b = catalog.find((x) => x._id === id);
+        return { id, name: b?.name ?? "Batch", image: b?.previewImage };
+      });
 
+      // NOTE: assumes /today accepts an optional ?date=YYYY-MM-DD. If it ignores
+      // the param it returns today's classes, and the date filter below hides
+      // anything that doesn't fall on the chosen day.
       const results = await Promise.all(
-        targetIds.map(async (batchId) => {
-          const batch = catalog.find((b) => b._id === batchId);
+        infos.map(async (batch) => {
           try {
-            const r = await fetch(`/api/batches/${batchId}/today`);
+            const r = await fetch(`/api/batches/${batch.id}/today?date=${dateStr}`);
             const d = await r.json();
             const rows: any[] = d?.classes ?? [];
-            return rows.map((c): RawLiveClass => ({
+            return rows.map((c): RawClass => ({
               id: c.id ?? "",
-              batchId,
-              batchName: batch?.name ?? "Batch",
-              batchImage: batch?.previewImage,
+              batchId: batch.id,
+              batchName: batch.name,
+              batchImage: batch.image,
               title: c.title ?? "Class",
               subject: c.subject ?? "",
-              startTime: c.startTime ?? "",
-              endTime: c.endTime ?? "",
               startMs: toMs(c.startTime),
               endMs: toMs(c.endTime),
               thumbnail: c.thumbnail ?? "",
@@ -210,14 +191,14 @@ export function LiveView() {
               subjectSlug: c.subjectSlug ?? "",
             }));
           } catch {
-            return [] as RawLiveClass[];
+            return [] as RawClass[];
           }
         })
       );
 
       if (!alive) return;
-      const todays = results.flat().filter((c) => withinToday(c.startMs, c.endMs));
-      setRaw(todays);
+      setBatches(infos);
+      setRaw(results.flat().filter((c) => onDate(c.startMs, dateStr) || onDate(c.endMs, dateStr)));
       hasLoaded.current = true;
       setNow(Date.now());
     };
@@ -236,57 +217,55 @@ export function LiveView() {
     return () => {
       alive = false;
     };
-  }, [attempt]);
+  }, [attempt, dateStr]);
 
-  /* derive statuses from the clock */
-  const classes: LiveClass[] = useMemo(
-    () => (raw ?? []).map((c) => ({ ...c, status: getStatus(c.startMs, c.endMs, now) })),
+  /* pick a sensible default batch: first one that has classes on this date */
+  useEffect(() => {
+    if (batches.length === 0) return;
+    if (batchId && batches.some((b) => b.id === batchId)) return;
+    const withClasses = batches.find((b) => raw.some((c) => c.batchId === b.id));
+    setBatchId((withClasses ?? batches[0]).id);
+  }, [batches, raw, batchId]);
+
+  const classes: ScheduleClass[] = useMemo(
+    () =>
+      raw
+        .map((c) => ({ ...c, status: getStatus(c.startMs, c.endMs, now) }))
+        .sort((a, b) => (Number.isNaN(a.startMs) ? 0 : a.startMs) - (Number.isNaN(b.startMs) ? 0 : b.startMs)),
     [raw, now]
   );
 
-  const counts = useMemo(
-    () => ({
-      all: classes.length,
-      live: classes.filter((c) => c.status === "live").length,
-      upcoming: classes.filter((c) => c.status === "upcoming").length,
-      ended: classes.filter((c) => c.status === "ended").length,
-    }),
-    [classes]
+  const batchClasses = useMemo(() => classes.filter((c) => c.batchId === batchId), [classes, batchId]);
+
+  const grouped = useMemo(
+    () =>
+      batches
+        .map((b) => ({ batch: b, items: classes.filter((c) => c.batchId === b.id) }))
+        .filter((g) => g.items.length > 0),
+    [batches, classes]
   );
 
-  const subjects = useMemo(
-    () => Array.from(new Set(classes.map((c) => c.subject).filter(Boolean))).sort(),
-    [classes]
-  );
+  const liveCount = classes.filter((c) => c.status === "live").length;
 
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return classes.filter((c) => {
-      if (filter !== "all" && c.status !== filter) return false;
-      if (subject !== "all" && c.subject !== subject) return false;
-      if (q && !`${c.title} ${c.subject} ${c.batchName}`.toLowerCase().includes(q)) return false;
-      return true;
-    });
-  }, [classes, filter, subject, query]);
+  /* the card the row should scroll to: first live, else first upcoming */
+  const focusKey = useMemo(() => {
+    const f = batchClasses.find((c) => c.status === "live") ?? batchClasses.find((c) => c.status === "upcoming");
+    return f ? `${f.batchId}:${f.id}` : "";
+  }, [batchClasses]);
 
-  const byTime = (a: LiveClass, b: LiveClass) =>
-    (Number.isNaN(a.startMs) ? 0 : a.startMs) - (Number.isNaN(b.startMs) ? 0 : b.startMs);
+  useEffect(() => {
+    const row = rowRef.current;
+    if (!row || !focusKey) return;
+    const el = row.querySelector<HTMLElement>(`[data-key="${CSS.escape(focusKey)}"]`);
+    if (el) row.scrollTo({ left: Math.max(0, el.offsetLeft - 16), behavior: "smooth" });
+  }, [focusKey, batchId, dateStr]);
 
-  const liveList = useMemo(() => filtered.filter((c) => c.status === "live").sort(byTime), [filtered]);
-  const upcomingList = useMemo(() => filtered.filter((c) => c.status === "upcoming").sort(byTime), [filtered]);
-  const endedList = useMemo(() => filtered.filter((c) => c.status === "ended").sort((a, b) => byTime(b, a)), [filtered]);
-
-  const isPristine = filter === "all" && subject === "all" && query.trim() === "";
-  const spotlight = isPristine ? liveList[0] : undefined;
-  const otherLive = spotlight ? liveList.slice(1) : liveList;
-
-  const nextUpId = useMemo(() => {
-    const first = classes.filter((c) => c.status === "upcoming").sort(byTime)[0];
-    return first ? `${first.batchId}:${first.id}` : "";
-  }, [classes]);
+  const scrollRow = (dir: 1 | -1) => {
+    rowRef.current?.scrollBy({ left: dir * 300, behavior: "smooth" });
+  };
 
   const openClass = useCallback(
-    (c: LiveClass) => {
+    (c: ScheduleClass) => {
       if (c.id && c.subjectSlug) {
         navigate({
           view: "watch",
@@ -306,438 +285,272 @@ export function LiveView() {
     [navigate]
   );
 
-  const clearFilters = () => {
-    setFilter("all");
-    setSubject("all");
-    setQuery("");
-  };
-
-  const tabs: { key: Filter; label: string; count: number }[] = [
-    { key: "all", label: "All", count: counts.all },
-    { key: "live", label: "Live", count: counts.live },
-    { key: "upcoming", label: "Upcoming", count: counts.upcoming },
-    { key: "ended", label: "Ended", count: counts.ended },
-  ];
-
   return (
     <main className="flex-1 w-full px-4 pb-20 sm:px-8 lg:px-12">
-      <div className="mx-auto max-w-6xl pt-8 sm:pt-12 space-y-6">
-        {/* ---------- header ---------- */}
-        <div className="sb-fade-up flex flex-wrap items-end justify-between gap-4">
-          <div>
-            <h1 className="text-3xl font-extrabold tracking-tight sm:text-4xl">Today's classes</h1>
-            <p className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
-              <span
-                className={cn(
-                  "inline-flex h-2 w-2 rounded-full",
-                  counts.live > 0 ? "bg-red-500 animate-pulse" : "bg-muted-foreground/40"
-                )}
-              />
-              {loading
-                ? "Loading today's schedule..."
-                : `${counts.live} live now, ${counts.upcoming} coming up, ${counts.ended} finished`}
-            </p>
-          </div>
-          <GlassButton variant="glass" size="sm" onClick={() => setAttempt((v) => v + 1)} disabled={refreshing}>
-            {refreshing ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
-            Refresh
-          </GlassButton>
-        </div>
-
-        {/* ---------- states ---------- */}
-        {loading ? (
-          <div className="space-y-4">
-            <GlassSkeleton className="h-56" />
-            {Array.from({ length: 3 }).map((_, i) => (
-              <GlassSkeleton key={i} className="h-36" />
-            ))}
-          </div>
-        ) : failed ? (
-          <>
-            <EmptyState
-              icon={<Radio size={22} />}
-              title="Couldn't load today's classes"
-              hint="Check your connection, then refresh."
-            />
-            <div className="flex justify-center">
-              <GlassButton variant="gold" size="sm" onClick={() => setAttempt((v) => v + 1)}>
-                <RefreshCw size={14} /> Try again
-              </GlassButton>
+      <div className="mx-auto max-w-7xl pt-8 sm:pt-12">
+        <section
+          aria-label="Class schedule"
+          className="rounded-2xl border border-white/10 bg-[#0a0e13] p-4 sm:p-8"
+        >
+          {/* ---------- controls ---------- */}
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="relative">
+              <label htmlFor="batch-select" className="sr-only">
+                Batch
+              </label>
+              <select
+                id="batch-select"
+                value={batchId}
+                onChange={(e) => setBatchId(e.target.value)}
+                disabled={batches.length === 0}
+                className="h-12 min-w-[220px] max-w-[320px] cursor-pointer appearance-none truncate rounded-xl border border-white/15 bg-transparent pl-5 pr-11 text-sm font-semibold outline-none transition-colors hover:border-white/30 focus-visible:ring-2 focus-visible:ring-purple-500/60"
+              >
+                {batches.length === 0 && <option value="">No batches</option>}
+                {batches.map((b) => (
+                  <option key={b.id} value={b.id} className="bg-[#0a0e13]">
+                    {b.name}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown size={16} className="pointer-events-none absolute right-4 top-1/2 -translate-y-1/2" />
             </div>
-          </>
-        ) : classes.length === 0 ? (
-          <EmptyState
-            icon={<Radio size={22} />}
-            title="No classes scheduled today"
-            hint="Enroll in a batch to see its daily schedule here."
-          />
-        ) : (
-          <>
-            {/* ---------- toolbar ---------- */}
-            <div className="space-y-3">
-              <div className="flex flex-wrap items-center gap-3">
-                <div role="tablist" aria-label="Class status" className="flex flex-wrap gap-1.5 rounded-2xl border border-white/10 bg-white/5 p-1">
-                  {tabs.map((t) => (
-                    <button
-                      key={t.key}
-                      type="button"
-                      role="tab"
-                      aria-selected={filter === t.key}
-                      onClick={() => setFilter(t.key)}
-                      className={cn(
-                        "inline-flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-sm font-semibold transition-colors",
-                        filter === t.key
-                          ? "bg-white/15 text-foreground"
-                          : "text-muted-foreground hover:text-foreground"
-                      )}
-                    >
-                      {t.key === "live" && (
-                        <span className={cn("h-1.5 w-1.5 rounded-full", t.count > 0 ? "bg-red-500 animate-pulse" : "bg-muted-foreground/40")} />
-                      )}
-                      {t.label}
-                      <span className="text-xs text-muted-foreground">{t.count}</span>
-                    </button>
-                  ))}
-                </div>
 
-                <label className="relative ml-auto w-full sm:w-72">
-                  <span className="sr-only">Search classes</span>
-                  <Search size={15} className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
-                  <input
-                    value={query}
-                    onChange={(e) => setQuery(e.target.value)}
-                    placeholder="Search class, subject or batch"
-                    className="h-10 w-full rounded-2xl border border-white/10 bg-white/5 pl-9 pr-9 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-[#4a9eff]/60"
-                  />
-                  {query && (
-                    <button
-                      type="button"
-                      aria-label="Clear search"
-                      onClick={() => setQuery("")}
-                      className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded-full p-1 text-muted-foreground hover:text-foreground"
-                    >
-                      <X size={14} />
-                    </button>
-                  )}
-                </label>
-              </div>
+            <label className="relative flex min-w-[250px] cursor-pointer items-center gap-4 rounded-2xl border border-white/10 bg-gradient-to-r from-white/[0.03] to-white/[0.07] px-4 py-3 transition-colors hover:border-white/25 focus-within:ring-2 focus-within:ring-purple-500/60">
+              <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/10">
+                <CalendarDays size={18} />
+              </span>
+              <span className="flex-1">
+                <span className="block text-[11px] font-bold tracking-wider text-slate-400">SCHEDULE DATE</span>
+                <span className="block text-base font-bold">{fmtDateLabel(dateStr)}</span>
+              </span>
+              <ChevronDown size={16} className="text-slate-400" />
+              <input
+                type="date"
+                aria-label="Schedule date"
+                value={dateStr}
+                onChange={(e) => e.target.value && setDateStr(e.target.value)}
+                onClick={(e) => {
+                  try {
+                    e.currentTarget.showPicker?.();
+                  } catch {
+                    /* some browsers only open on the native icon */
+                  }
+                }}
+                className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+              />
+            </label>
+          </div>
 
-              {subjects.length > 1 && (
-                <div className="flex gap-2 overflow-x-auto pb-1" aria-label="Filter by subject">
-                  {["all", ...subjects].map((s) => (
-                    <button
-                      key={s}
-                      type="button"
-                      onClick={() => setSubject(s)}
-                      aria-pressed={subject === s}
-                      className={cn(
-                        "shrink-0 rounded-full border px-3.5 py-1 text-xs font-semibold transition-colors",
-                        subject === s
-                          ? "border-[#4a9eff]/60 bg-[#4a9eff]/15 text-[#4a9eff]"
-                          : "border-white/10 text-muted-foreground hover:text-foreground"
-                      )}
-                    >
-                      {s === "all" ? "All subjects" : s}
-                    </button>
-                  ))}
-                </div>
+          {/* ---------- heading ---------- */}
+          <div className="mt-8 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <h1 className="text-xl font-bold tracking-tight">Class Schedule</h1>
+              {liveCount > 0 && (
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-red-600/15 px-2.5 py-1 text-xs font-bold text-red-400">
+                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-red-500" />
+                  {liveCount} live now
+                </span>
               )}
             </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setAttempt((v) => v + 1)}
+                disabled={refreshing}
+                aria-label="Refresh schedule"
+                className="flex h-9 w-9 items-center justify-center rounded-lg border border-white/10 text-slate-300 transition-colors hover:border-white/30 hover:text-white disabled:opacity-60"
+              >
+                {refreshing ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
+              </button>
+              <button
+                type="button"
+                onClick={() => scrollRow(-1)}
+                aria-label="Scroll classes left"
+                className="hidden h-9 w-9 items-center justify-center rounded-lg border border-white/10 text-slate-300 transition-colors hover:border-white/30 hover:text-white sm:flex"
+              >
+                <ChevronLeft size={16} />
+              </button>
+              <button
+                type="button"
+                onClick={() => scrollRow(1)}
+                aria-label="Scroll classes right"
+                className="hidden h-9 w-9 items-center justify-center rounded-lg border border-white/10 text-slate-300 transition-colors hover:border-white/30 hover:text-white sm:flex"
+              >
+                <ChevronRight size={16} />
+              </button>
+            </div>
+          </div>
 
-            {/* ---------- results ---------- */}
-            {filtered.length === 0 ? (
+          {/* ---------- cards row ---------- */}
+          <div className="mt-5">
+            {loading ? (
+              <div className="flex gap-4 overflow-hidden">
+                {Array.from({ length: 4 }).map((_, i) => (
+                  <GlassSkeleton key={i} className="h-[256px] w-[274px] shrink-0 rounded-xl" />
+                ))}
+              </div>
+            ) : failed ? (
               <>
                 <EmptyState
-                  icon={<Search size={22} />}
-                  title="No classes match these filters"
-                  hint="Clear the filters to see everything scheduled today."
+                  icon={<Radio size={22} />}
+                  title="Couldn't load the schedule"
+                  hint="Check your connection, then refresh."
                 />
-                <div className="flex justify-center">
-                  <GlassButton variant="glass" size="sm" onClick={clearFilters}>
-                    Clear filters
-                  </GlassButton>
+                <div className="mt-3 flex justify-center">
+                  <button
+                    type="button"
+                    onClick={() => setAttempt((v) => v + 1)}
+                    className="inline-flex items-center gap-2 rounded-lg bg-white px-4 py-2 text-sm font-semibold text-black"
+                  >
+                    <RefreshCw size={14} /> Try again
+                  </button>
                 </div>
               </>
+            ) : batchClasses.length === 0 ? (
+              <EmptyState
+                icon={<CalendarDays size={22} />}
+                title="No classes on this date"
+                hint={
+                  classes.length > 0
+                    ? "Other batches have classes today. Open View All Batches/Classes to see them."
+                    : "Pick another date or batch to see its schedule."
+                }
+              />
             ) : (
-              <div className="space-y-8">
-                {spotlight && <Spotlight c={spotlight} now={now} onOpen={() => openClass(spotlight)} />}
-
-                <Section title={spotlight ? "Also live" : "Live now"} count={otherLive.length} tone="live">
-                  {otherLive.map((c) => (
-                    <LectureCard key={`${c.batchId}:${c.id}`} c={c} now={now} onOpen={() => openClass(c)} />
-                  ))}
-                </Section>
-
-                <Section title="Coming up" count={upcomingList.length} tone="upcoming">
-                  {upcomingList.map((c) => (
-                    <LectureCard
-                      key={`${c.batchId}:${c.id}`}
-                      c={c}
-                      now={now}
-                      isNext={`${c.batchId}:${c.id}` === nextUpId}
-                      onOpen={() => openClass(c)}
-                    />
-                  ))}
-                </Section>
-
-                <Section title="Finished" count={endedList.length} tone="ended">
-                  {endedList.map((c) => (
-                    <LectureCard key={`${c.batchId}:${c.id}`} c={c} now={now} onOpen={() => openClass(c)} />
-                  ))}
-                </Section>
+              <div
+                ref={rowRef}
+                className="flex snap-x snap-mandatory gap-4 overflow-x-auto pb-3 [scrollbar-width:thin]"
+              >
+                {batchClasses.map((c) => (
+                  <ClassCard
+                    key={`${c.batchId}:${c.id}`}
+                    c={c}
+                    now={now}
+                    onOpen={() => openClass(c)}
+                    className="w-[274px] shrink-0 snap-start"
+                  />
+                ))}
               </div>
             )}
-          </>
-        )}
+          </div>
+
+          {/* ---------- view all ---------- */}
+          {!loading && !failed && classes.length > 0 && (
+            <div className="mt-5 flex justify-center">
+              <button
+                type="button"
+                onClick={() => setShowAll((v) => !v)}
+                aria-expanded={showAll}
+                className="inline-flex items-center gap-2.5 rounded-lg bg-white px-6 py-3 text-sm font-semibold text-black transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-purple-500"
+              >
+                View All Batches/Classes
+                <ChevronDown size={16} className={cn("transition-transform", showAll && "rotate-180")} />
+              </button>
+            </div>
+          )}
+
+          {showAll && grouped.length > 0 && (
+            <div className="mt-8 space-y-8 border-t border-white/10 pt-8">
+              {grouped.map(({ batch, items }) => (
+                <div key={batch.id} className="space-y-4">
+                  <div className="flex items-center gap-3">
+                    <h2 className="text-base font-bold">{batch.name}</h2>
+                    <span className="text-sm text-slate-400">
+                      {items.length} {items.length === 1 ? "class" : "classes"}
+                    </span>
+                  </div>
+                  <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                    {items.map((c) => (
+                      <ClassCard key={`${c.batchId}:${c.id}`} c={c} now={now} onOpen={() => openClass(c)} className="w-full" />
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
       </div>
     </main>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* Section wrapper                                                     */
+/* Lecture card                                                        */
 /* ------------------------------------------------------------------ */
 
-function Section({
-  title,
-  count,
-  tone,
-  children,
-}: {
-  title: string;
-  count: number;
-  tone: Status;
-  children: React.ReactNode;
-}) {
-  if (count === 0) return null;
-  return (
-    <section aria-label={title} className="space-y-3">
-      <div className="flex items-center gap-3">
-        <span className={cn("h-4 w-1 rounded-full", STATUS_STYLE[tone].stripe)} />
-        <h2 className="text-lg font-bold tracking-tight">{title}</h2>
-        <span className="text-sm text-muted-foreground">{count}</span>
-      </div>
-      <div className="space-y-3">{children}</div>
-    </section>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* Spotlight: the class that is on air right now                       */
-/* ------------------------------------------------------------------ */
-
-function Spotlight({ c, now, onOpen }: { c: LiveClass; now: number; onOpen: () => void }) {
-  const pct = progressOf(c, now);
-  const elapsed = Number.isNaN(c.startMs) ? null : now - c.startMs;
-  const left = Number.isNaN(c.endMs) ? null : c.endMs - now;
-
-  return (
-    <GlassCard hover={false} sheen={false} className="overflow-hidden rounded-3xl ring-1 ring-red-500/30">
-      <div className="grid md:grid-cols-[1.15fr_1fr]">
-        <button
-          type="button"
-          onClick={onOpen}
-          aria-label={`Join ${c.title}`}
-          className="group relative block aspect-video w-full overflow-hidden md:aspect-auto md:min-h-[280px]"
-        >
-          <SafeImage
-            src={c.thumbnail}
-            alt={c.title}
-            className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-[1.03]"
-          />
-          <span className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/10 to-transparent" />
-          <span className="absolute left-4 top-4 inline-flex items-center gap-1.5 rounded-full bg-red-500 px-3 py-1 text-xs font-bold text-white shadow-lg">
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white" /> LIVE
-          </span>
-          <span className="absolute inset-0 flex items-center justify-center">
-            <span className="btn-gold flex h-16 w-16 items-center justify-center rounded-full transition-transform group-hover:scale-110">
-              <Play size={24} className="ml-1" />
-            </span>
-          </span>
-        </button>
-
-        <div className="flex flex-col justify-between gap-5 p-5 sm:p-7">
-          <div className="space-y-3">
-            <div className="flex flex-wrap items-center gap-2">
-              {c.subject && <GlassBadge tone="neutral">{c.subject}</GlassBadge>}
-              <GlassBadge tone="neutral">
-                <BookOpen size={10} /> {c.batchName}
-              </GlassBadge>
-            </div>
-            <h2 className="text-2xl font-extrabold leading-tight tracking-tight line-clamp-3">{c.title}</h2>
-            <p className="text-sm text-muted-foreground">
-              {fmtClock(c.startMs)} to {fmtClock(c.endMs)}
-              {c.duration ? `, ${c.duration}` : ""}
-            </p>
-          </div>
-
-          <div className="space-y-4">
-            {pct !== null ? (
-              <div className="space-y-2">
-                <div
-                  role="progressbar"
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  aria-valuenow={Math.round(pct)}
-                  aria-label="Class progress"
-                  className="h-2 overflow-hidden rounded-full bg-white/10"
-                >
-                  <div className="h-full rounded-full bg-red-500 transition-[width] duration-700" style={{ width: `${pct}%` }} />
-                </div>
-                <div className="flex justify-between text-xs text-muted-foreground">
-                  <span>{elapsed !== null ? `${fmtSpan(elapsed)} in` : ""}</span>
-                  <span>{left !== null ? `${fmtSpan(left)} left` : ""}</span>
-                </div>
-              </div>
-            ) : (
-              <p className="text-xs text-muted-foreground">
-                {elapsed !== null ? `Started ${fmtSpan(elapsed)} ago` : "On air now"}
-              </p>
-            )}
-            <GlassButton variant="gold" onClick={onOpen} className="w-full justify-center">
-              <Radio size={15} /> Join live class
-            </GlassButton>
-          </div>
-        </div>
-      </div>
-    </GlassCard>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* Rectangular lecture card                                            */
-/* ------------------------------------------------------------------ */
-
-function LectureCard({
+function ClassCard({
   c,
   now,
-  isNext,
   onOpen,
+  className,
 }: {
-  c: LiveClass;
+  c: ScheduleClass;
   now: number;
-  isNext?: boolean;
   onOpen: () => void;
+  className?: string;
 }) {
+  const pill = PILL[c.status];
+  const pct = progressOf(c, now);
   const isLive = c.status === "live";
   const isEnded = c.status === "ended";
-  const pct = progressOf(c, now);
-
-  const statusLine = isLive
-    ? pct !== null
-      ? `${fmtSpan(c.endMs - now)} left`
-      : "On air now"
-    : isEnded
-    ? "Recording may be available"
-    : countdownLabel(c.startMs, now);
 
   return (
-    <GlassCard hover={false} sheen={false} className={cn("overflow-hidden rounded-2xl", isEnded && "opacity-80")}>
-      <div className="flex flex-col sm:flex-row sm:items-stretch">
-        {/* status stripe */}
-        <span aria-hidden className={cn("h-1 w-full sm:h-auto sm:w-1.5 sm:shrink-0", STATUS_STYLE[c.status].stripe)} />
-
-        {/* thumbnail + details (one clickable region) */}
-        <button
-          type="button"
-          onClick={onOpen}
-          aria-label={`Open ${c.title}`}
-          className="group flex min-w-0 flex-1 cursor-pointer flex-col gap-4 p-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#4a9eff]/60 sm:flex-row sm:items-center sm:p-5"
-        >
-          <div className="relative aspect-video w-full shrink-0 overflow-hidden rounded-xl border border-white/10 sm:w-52">
-            <SafeImage
-              src={c.thumbnail}
-              alt=""
-              className={cn(
-                "h-full w-full object-cover transition-transform duration-500 group-hover:scale-105",
-                isEnded && "grayscale-[40%]"
-              )}
-            />
-            <span className="absolute inset-0 flex items-center justify-center bg-black/25">
-              <span className="btn-gold flex h-10 w-10 items-center justify-center rounded-full opacity-95 transition-transform group-hover:scale-110">
-                {isEnded ? <CheckCircle2 size={16} /> : <Play size={15} className="ml-0.5" />}
-              </span>
-            </span>
-            {c.duration && (
-              <span className="absolute bottom-1.5 right-1.5 rounded-md bg-black/70 px-1.5 py-0.5 text-[10px] font-semibold text-white">
-                {c.duration}
-              </span>
-            )}
+    <button
+      type="button"
+      onClick={onOpen}
+      data-key={`${c.batchId}:${c.id}`}
+      aria-label={`${pill.label.toLowerCase()}: ${c.title}, ${fmtClock(c.startMs)}`}
+      className={cn(
+        "group rounded-xl border bg-white/[0.02] p-2.5 text-left transition-colors",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-purple-500/70",
+        isLive ? "border-red-500/50 hover:border-red-500" : "border-white/10 hover:border-white/30",
+        className
+      )}
+    >
+      <div className="relative aspect-[16/9] w-full overflow-hidden rounded-md bg-white/5">
+        <SafeImage
+          src={c.thumbnail}
+          alt=""
+          className={cn(
+            "h-full w-full object-cover transition-transform duration-500 group-hover:scale-[1.03]",
+            isEnded && "opacity-80"
+          )}
+        />
+        {pct !== null && (
+          <div
+            role="progressbar"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(pct)}
+            aria-label="Class progress"
+            className="absolute inset-x-0 bottom-0 h-1 bg-black/40"
+          >
+            <div className="h-full bg-red-500 transition-[width] duration-700" style={{ width: `${pct}%` }} />
           </div>
-
-          <div className="min-w-0 flex-1 space-y-2">
-            <div className="flex flex-wrap items-center gap-2">
-              {isLive ? (
-                <GlassBadge tone="red">
-                  <Radio size={10} /> Live now
-                </GlassBadge>
-              ) : isEnded ? (
-                <GlassBadge tone="neutral">Ended</GlassBadge>
-              ) : (
-                <GlassBadge tone="gold">
-                  <Clock size={10} /> {isNext ? "Next up" : "Upcoming"}
-                </GlassBadge>
-              )}
-              {c.subject && <GlassBadge tone="neutral">{c.subject}</GlassBadge>}
-            </div>
-
-            <h3 className="line-clamp-2 text-base font-bold leading-snug">{c.title}</h3>
-
-            <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <BookOpen size={12} className="shrink-0" />
-              <span className="truncate">{c.batchName}</span>
-            </p>
-
-            {pct !== null && (
-              <div
-                role="progressbar"
-                aria-valuemin={0}
-                aria-valuemax={100}
-                aria-valuenow={Math.round(pct)}
-                aria-label="Class progress"
-                className="h-1.5 overflow-hidden rounded-full bg-white/10"
-              >
-                <div className="h-full rounded-full bg-red-500 transition-[width] duration-700" style={{ width: `${pct}%` }} />
-              </div>
-            )}
-          </div>
-        </button>
-
-        {/* time + actions panel */}
-        <div className="flex items-center justify-between gap-4 border-t border-white/10 px-4 py-3 sm:w-56 sm:shrink-0 sm:flex-col sm:items-stretch sm:justify-center sm:border-l sm:border-t-0 sm:p-5">
-          <div className="sm:text-center">
-            <p className="text-xl font-extrabold leading-none tabular-nums">{fmtClock(c.startMs)}</p>
-            <p className="mt-1 text-xs text-muted-foreground tabular-nums">
-              {Number.isNaN(c.endMs) ? "End time not set" : `to ${fmtClock(c.endMs)}`}
-            </p>
-            <p
-              className={cn(
-                "mt-2 text-xs font-semibold",
-                isLive ? "text-red-400" : isEnded ? "text-muted-foreground" : "text-[#4a9eff]"
-              )}
-            >
-              {statusLine}
-            </p>
-          </div>
-
-          <div className="flex items-center gap-2 sm:flex-col sm:items-stretch">
-            <GlassButton variant={isLive ? "gold" : "glass"} size="sm" onClick={onOpen} className="justify-center">
-              {isLive ? <Radio size={14} /> : <Play size={14} />}
-              {isLive ? "Join live" : isEnded ? "Watch again" : "Open class"}
-            </GlassButton>
-            {c.status === "upcoming" && (
-              <a
-                href={calendarUrl(c)}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center justify-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4a9eff]/60"
-              >
-                <CalendarPlus size={13} /> Add to calendar
-              </a>
-            )}
-          </div>
-        </div>
+        )}
       </div>
-    </GlassCard>
+
+      <div className="mt-3.5 flex items-center justify-between gap-2">
+        <span
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold text-white",
+            pill.cls
+          )}
+        >
+          {isLive && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white" />}
+          {pill.label}
+        </span>
+        <span className="inline-flex items-center gap-1.5 text-sm text-slate-400 tabular-nums">
+          <Clock size={14} />
+          {fmtClock(c.startMs)}
+        </span>
+      </div>
+
+      <div className="mt-3 border-t border-white/10 pt-3">
+        <h3 className="truncate text-[15px] font-bold" title={c.title}>
+          {c.title}
+        </h3>
+      </div>
+    </button>
   );
 }
